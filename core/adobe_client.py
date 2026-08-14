@@ -47,6 +47,31 @@ def _decode_jwt_payload(token: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+# 出图请求头协议配置：express（new.express.adobe.com）与 firefly（firefly.adobe.com）
+# 两种站点对浏览器请求头的要求不同，历史提交 d83f96c 曾切换到 express 以规避 408，
+# 但对 firefly-3p 端点必须使用 firefly 头（clio-playground-web + firefly origin + nonce + arp）。
+PROTOCOL_PROFILES = {
+    "firefly": {
+        "api_key": "clio-playground-web",
+        "origin": "https://firefly.adobe.com",
+        "referer": "https://firefly.adobe.com/",
+        "sec_fetch_site": "same-site",
+        "use_submit_nonce": True,
+        "use_arp_session_id": True,
+        "poll_with_api_key": False,
+    },
+    "express": {
+        "api_key": "projectx_webapp",
+        "origin": "https://new.express.adobe.com",
+        "referer": "https://new.express.adobe.com/",
+        "sec_fetch_site": "cross-site",
+        "use_submit_nonce": False,
+        "use_arp_session_id": False,
+        "poll_with_api_key": True,
+    },
+}
+
+
 def _build_submit_nonce(token: str, prompt: str) -> str:
     claims = _decode_jwt_payload(token)
     user_id = str(
@@ -133,7 +158,7 @@ class AdobeClient:
     platform_cs_base = "https://platform-cs-va6.adobe.io/composite/component/path"
 
     def __init__(self) -> None:
-        self.api_key = "projectx_webapp"
+        self.api_key = "clio-playground-web"
         self.impersonate = "chrome124"
         self.proxy = ""
         self.generate_timeout = 300
@@ -144,6 +169,8 @@ class AdobeClient:
         self.retry_on_error_types = {"timeout", "connection", "proxy"}
         self.token_rotation_strategy = "round_robin"
         self.gpt_image_quality = "low"
+        self.protocol = "firefly"
+        self._profile = PROTOCOL_PROFILES["firefly"]
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         self.sec_ch_ua = (
             '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"'
@@ -177,6 +204,15 @@ class AdobeClient:
                 pass
 
     def apply_config(self, cfg: dict) -> None:
+        protocol = str(cfg.get("generation_protocol", "firefly") or "firefly").strip().lower()
+        if protocol not in PROTOCOL_PROFILES:
+            protocol = "firefly"
+        if protocol != self.protocol:
+            # 仅在协议切换时同步 api_key，避免覆盖用户通过环境变量 ADOBE_API_KEY 设置的值
+            self.protocol = protocol
+            self.api_key = PROTOCOL_PROFILES[protocol]["api_key"]
+        self._profile = PROTOCOL_PROFILES[self.protocol]
+
         proxy = str(cfg.get("proxy", "")).strip()
         use_proxy = bool(cfg.get("use_proxy", False))
         timeout_val = cfg.get("generate_timeout", 300)
@@ -304,15 +340,16 @@ class AdobeClient:
         return CurlSession(**kwargs)
 
     def _browser_headers(self) -> dict:
+        profile = self._profile
         return {
             "user-agent": self.user_agent,
-            "origin": "https://new.express.adobe.com",
-            "referer": "https://new.express.adobe.com/",
+            "origin": profile["origin"],
+            "referer": profile["referer"],
             "accept-language": "en-US,en;q=0.9",
             "sec-ch-ua": self.sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-site": "cross-site",
+            "sec-fetch-site": profile["sec_fetch_site"],
             "sec-fetch-mode": "cors",
             "sec-fetch-dest": "empty",
         }
@@ -327,6 +364,12 @@ class AdobeClient:
                 "accept": "*/*",
             }
         )
+        if self._profile["use_submit_nonce"]:
+            submit_nonce = _build_submit_nonce(token, prompt)
+            if submit_nonce:
+                headers["x-nonce"] = submit_nonce
+        if self._profile["use_arp_session_id"]:
+            headers["x-arp-session-id"] = _build_arp_session_id()
         return headers
 
     def _submit_headers_minimal(self, token: str) -> dict:
@@ -350,15 +393,18 @@ class AdobeClient:
         return headers
 
     def _poll_headers(self, token: str) -> dict:
-        return {
+        profile = self._profile
+        headers = {
             "Authorization": f"Bearer {token}",
             "accept": "*/*",
-            "referer": "https://new.express.adobe.com/",
-            "origin": "https://new.express.adobe.com",
+            "referer": profile["referer"],
+            "origin": profile["origin"],
             "user-agent": self.user_agent,
-            "x-api-key": self.api_key,
-            "content-type": "application/json",
         }
+        if profile["poll_with_api_key"]:
+            headers["x-api-key"] = self.api_key
+            headers["content-type"] = "application/json"
+        return headers
 
     def _entity_headers(self, token: str) -> dict:
         return {

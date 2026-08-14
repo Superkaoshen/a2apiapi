@@ -1312,6 +1312,7 @@ app.include_router(
         is_admin_authenticated=_is_admin_authenticated,
         apply_client_config=_apply_client_config,
         get_generated_storage_stats=_get_generated_storage_stats,
+        client=client,
     )
 )
 

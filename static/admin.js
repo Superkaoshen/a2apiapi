@@ -1640,8 +1640,116 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
+  // Test Generate
+  const testTokenSelect = document.getElementById("testTokenSelect");
+  const testPrompt = document.getElementById("testPrompt");
+  const testProtocol = document.getElementById("testProtocol");
+  const testRatio = document.getElementById("testRatio");
+  const testResolution = document.getElementById("testResolution");
+  const testTimeout = document.getElementById("testTimeout");
+  const testGenerateBtn = document.getElementById("testGenerateBtn");
+  const testStatus = document.getElementById("testStatus");
+  const testResultMeta = document.getElementById("testResultMeta");
+  const testImage = document.getElementById("testImage");
+  const testImageEmpty = document.getElementById("testImageEmpty");
+  const testRefreshTokensBtn = document.getElementById("testRefreshTokensBtn");
+
+  function maskTokenDisplay(token) {
+    const v = String(token?.value || token?.id || "");
+    if (!v) return "";
+    if (v.length > 20) return `${v.slice(0, 10)}...${v.slice(-6)}`;
+    return `${v.slice(0, 8)}...`;
+  }
+
+  async function loadTestTokens() {
+    try {
+      const res = await fetch("/api/v1/tokens");
+      const data = await res.json();
+      const tokens = Array.isArray(data?.tokens) ? data.tokens : [];
+      const keep = testTokenSelect.value;
+      testTokenSelect.innerHTML = '<option value="">自动选择（按策略轮询）</option>';
+      tokens.forEach((t) => {
+        const label = `${maskTokenDisplay(t)}  [${t.status || "-"}]` +
+          (t.refresh_profile_name ? `  ${t.refresh_profile_name}` : "");
+        const opt = document.createElement("option");
+        opt.value = String(t.id || "");
+        opt.textContent = label;
+        if (String(t.id || "") === keep) opt.selected = true;
+        testTokenSelect.appendChild(opt);
+      });
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  function setTestStatus(text, isError = false) {
+    testStatus.textContent = text;
+    testStatus.style.color = isError ? "#ffb4bc" : "#4de2c4";
+  }
+
+  testRefreshTokensBtn?.addEventListener("click", () => {
+    loadTestTokens();
+    setTestStatus("已刷新 Token 列表", false);
+  });
+
+  testGenerateBtn?.addEventListener("click", async () => {
+    const prompt = (testPrompt.value || "").trim();
+    if (!prompt) {
+      setTestStatus("请先填写提示词", true);
+      return;
+    }
+    testGenerateBtn.disabled = true;
+    setTestStatus("正在提交并等待出图…（可能需 30~120 秒）", false);
+    testResultMeta.textContent = "";
+    testImage.style.display = "none";
+    testImageEmpty.style.display = "block";
+    try {
+      const body = {
+        prompt,
+        aspect_ratio: testRatio.value || "1:1",
+        output_resolution: testResolution.value || "2K",
+        timeout: Number(testTimeout.value) || 180,
+        protocol: testProtocol.value || "service",
+      };
+      if (testTokenSelect.value) body.token_id = testTokenSelect.value;
+      const res = await fetch("/api/v1/test-generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!data || data.ok !== true) {
+        setTestStatus(
+          `出图失败：${data?.error || "未知错误"}` +
+            (data?.error_type ? `（${data.error_type}）` : ""),
+          true
+        );
+        testResultMeta.textContent =
+          `token: ${data?.token || "-"}\n` +
+          `error_type: ${data?.error_type || "-"}\n` +
+          (data?.meta ? JSON.stringify(data.meta, null, 2) : "");
+        return;
+      }
+      if (data.image_base64) {
+        testImage.src = `data:${data.mime_type || "image/png"};base64,${data.image_base64}`;
+        testImage.style.display = "block";
+        testImageEmpty.style.display = "none";
+      }
+      setTestStatus(`出图成功（${((data.size_bytes || 0) / 1024).toFixed(1)} KB）`, false);
+      testResultMeta.textContent =
+        `token: ${data.token || "-"}\n` +
+        `size: ${data.size_bytes || 0} bytes\n` +
+        (data.meta ? JSON.stringify(data.meta, null, 2) : "");
+    } catch (err) {
+      setTestStatus(`请求出错：${err.message}`, true);
+    } finally {
+      testGenerateBtn.disabled = false;
+    }
+  });
+
   // Init
   loadTokens();
   loadConfig();
   renderLogsPagination();
+  loadTestTokens();
 });

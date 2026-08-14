@@ -23,6 +23,7 @@
       <button class="tab-btn active" data-target="tokens">Token 管理</button>
       <button class="tab-btn" data-target="config">系统配置</button>
       <button class="tab-btn" data-target="logs">请求日志</button>
+      <button class="tab-btn" data-target="test">测试出图</button>
     </div>
 
     <!-- Tokens Tab -->
@@ -290,6 +291,79 @@
           <button id="logsPrevBtn" class="secondary small" type="button">上一页</button>
           <span id="logsPageInfo" class="help">第 1 / 1 页</span>
           <button id="logsNextBtn" class="secondary small" type="button">下一页</button>
+        </div>
+      </section>
+    </div>
+
+    <!-- Test Generate Tab -->
+    <div id="test" class="tab-pane">
+      <section class="card">
+        <div class="list-head">
+          <h2>测试出图</h2>
+          <div class="actions">
+            <button id="testRefreshTokensBtn" class="secondary">刷新 Token 列表</button>
+          </div>
+        </div>
+        <p class="help" style="margin-bottom: 16px;">选择一个 Token 并填写提示词，提交一条真实的 Firefly 出图请求，验证账号是否还能出图。</p>
+
+        <div class="test-grid">
+          <div class="test-form">
+            <div class="form-row" style="grid-template-columns: 1fr 1fr;">
+              <div class="form-group">
+                <label for="testTokenSelect">测试 Token</label>
+                <select id="testTokenSelect" class="input-select">
+                  <option value="">自动选择（按策略轮询）</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="testProtocol">协议</label>
+                <select id="testProtocol" class="input-select">
+                  <option value="service">服务端 generate（express）</option>
+                  <option value="firefly" selected>Firefly 直连（clio-playground-web）</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="testPrompt">提示词</label>
+              <textarea id="testPrompt" rows="3" placeholder="例如：画一个女孩，水彩风格，柔和光线">画一个女孩</textarea>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="testRatio">宽高比</label>
+                <select id="testRatio" class="input-select">
+                  <option value="1:1" selected>1:1</option>
+                  <option value="16:9">16:9</option>
+                  <option value="9:16">9:16</option>
+                  <option value="4:3">4:3</option>
+                  <option value="3:4">3:4</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="testResolution">分辨率</label>
+                <select id="testResolution" class="input-select">
+                  <option value="2K" selected>2K</option>
+                  <option value="1K">1K</option>
+                  <option value="4K">4K</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="testTimeout">超时（秒）</label>
+                <input id="testTimeout" type="number" value="180" min="10" max="600" class="input-text" />
+              </div>
+            </div>
+            <div class="actions" style="margin-top: 16px;">
+              <button id="testGenerateBtn">开始出图</button>
+            </div>
+            <p id="testStatus" class="help" style="margin-top: 12px; min-height: 20px;"></p>
+          </div>
+
+          <div class="test-result">
+            <div id="testResultMeta" class="help" style="white-space: pre-wrap;"></div>
+            <div id="testImageWrap" class="test-image-wrap">
+              <div id="testImageEmpty" class="empty-state">出图结果将显示在这里</div>
+              <img id="testImage" alt="测试出图结果" style="display: none; max-width: 100%; border-radius: 8px;" />
+            </div>
+          </div>
         </div>
       </section>
     </div>

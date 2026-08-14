@@ -1,12 +1,23 @@
+import base64
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from starlette.responses import RedirectResponse
+
+from core.adobe_client import (
+    AdobeRequestError,
+    AuthError,
+    QuotaExhaustedError,
+    UpstreamTemporaryError,
+    _build_submit_nonce,
+)
 
 from api.schemas import (
     AdminLoginRequest,
@@ -19,6 +30,28 @@ from api.schemas import (
     TokenBatchAddRequest,
     TokenCreditsBatchRefreshRequest,
 )
+
+
+def _json_safe_meta(meta: Any) -> Any:
+    """Strip non-JSON-serializable values from generation meta before returning."""
+    if isinstance(meta, dict):
+        return {
+            str(k): _json_safe_meta(v)
+            for k, v in meta.items()
+            if k not in ("raw", "request_payload", "headers", "cookies")
+        }
+    if isinstance(meta, (list, tuple)):
+        return [_json_safe_meta(v) for v in meta]
+    if isinstance(meta, (str, int, float, bool)) or meta is None:
+        return meta
+    try:
+        import json
+
+        json.dumps(meta)
+        return meta
+    except Exception:
+        return str(meta)
+
 
 
 def build_admin_router(
@@ -34,8 +67,116 @@ def build_admin_router(
     is_admin_authenticated: Callable[[Request], bool],
     apply_client_config: Callable[[], None],
     get_generated_storage_stats: Callable[[], dict[str, Any]],
+    client,
 ) -> APIRouter:
     router = APIRouter()
+
+    class TestGenerateRequest(BaseModel):
+        prompt: str
+        aspect_ratio: str = "1:1"
+        output_resolution: str = "2K"
+        token_id: Optional[str] = None
+        timeout: int = 180
+        protocol: str = "service"
+
+    def _firefly_generate(
+        client,
+        token: str,
+        prompt: str,
+        aspect_ratio: str,
+        output_resolution: str,
+        timeout: int,
+    ) -> tuple[Optional[bytes], dict]:
+        """Firefly 协议直连出图：clio-playground-web + firefly origin + x-nonce。
+
+        不修改 client 全局状态（旧项目默认 express 协议），只在本调用内走 firefly 头。
+        """
+        payload = client._build_payload_candidates(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            output_resolution=output_resolution,
+            upstream_model_id="gemini-flash",
+            upstream_model_version="nano-banana-2",
+            quality_level=None,
+            detail_level=None,
+        )[0]
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "x-api-key": "clio-playground-web",
+            "content-type": "application/json",
+            "accept": "*/*",
+            "x-nonce": _build_submit_nonce(token, prompt),
+            "user-agent": client.user_agent,
+            "origin": "https://firefly.adobe.com",
+            "referer": "https://firefly.adobe.com/",
+            "accept-language": "en-US,en;q=0.9",
+        }
+
+        submit = client._post_json(client.submit_url, headers=headers, payload=payload)
+        if submit.status_code in (401, 403):
+            if submit.headers.get("x-access-error") == "taste_exhausted":
+                raise QuotaExhaustedError("Adobe quota exhausted for this account")
+            raise AuthError("Token invalid or expired")
+
+        if submit.status_code != 200:
+            if submit.status_code in (429, 451) or submit.status_code >= 500:
+                raise UpstreamTemporaryError(
+                    f"submit failed: {submit.status_code} {submit.text[:300]}",
+                    status_code=submit.status_code,
+                    error_type="status",
+                )
+            raise AdobeRequestError(
+                f"submit failed: {submit.status_code} {submit.text[:300]}"
+            )
+
+        submit_data = submit.json()
+        poll_url = client._extract_result_link(submit, submit_data)
+        if not poll_url:
+            raise AdobeRequestError("submit succeeded but no poll url returned")
+
+        start = time.time()
+        latest: dict = {}
+        while True:
+            poll_resp = client._get(
+                poll_url, headers=client._poll_headers(token), timeout=60
+            )
+            if poll_resp.status_code != 200:
+                if poll_resp.status_code in (429, 451) or poll_resp.status_code >= 500:
+                    raise UpstreamTemporaryError(
+                        f"poll failed: {poll_resp.status_code} {poll_resp.text[:300]}",
+                        status_code=poll_resp.status_code,
+                        error_type="status",
+                    )
+                raise AdobeRequestError(
+                    f"poll failed: {poll_resp.status_code} {poll_resp.text[:300]}"
+                )
+
+            latest = poll_resp.json()
+            outputs = latest.get("outputs") or []
+            if outputs:
+                image_url = ((outputs[0] or {}).get("image") or {}).get(
+                    "presignedUrl"
+                )
+                if not image_url:
+                    raise AdobeRequestError("job finished without image url")
+                with tempfile.TemporaryDirectory() as td:
+                    out_path = Path(td) / "out.png"
+                    client._download_to_file(
+                        image_url,
+                        headers={"accept": "*/*"},
+                        out_path=out_path,
+                        timeout=30,
+                    )
+                    image_bytes = out_path.read_bytes()
+                return image_bytes, latest
+
+            if time.time() - start > timeout:
+                raise TimeoutError("poll timeout")
+
+            time.sleep(3.0)
+
+        return None, latest
 
     def get_batch_concurrency() -> int:
         try:
@@ -62,6 +203,115 @@ def build_admin_router(
     @router.get("/api/v1/health")
     def health():
         return {"status": "ok", "pool_size": len(token_manager.list_all())}
+
+    @router.post("/api/v1/test-generate")
+    def test_generate(req: TestGenerateRequest, request: Request):
+        require_admin_auth(request)
+
+        prompt = str(req.prompt or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="prompt cannot be empty")
+
+        ratio = str(req.aspect_ratio or "1:1").strip() or "1:1"
+        resolution = str(req.output_resolution or "2K").upper()
+        if resolution not in {"1K", "2K", "4K"}:
+            raise HTTPException(status_code=400, detail="unsupported output_resolution")
+
+        apply_client_config()
+
+        token: Optional[str] = None
+        token_display = "auto"
+        if req.token_id:
+            info = token_manager.get_by_id(req.token_id)
+            if not info:
+                raise HTTPException(status_code=404, detail="token not found")
+            token = str(info.get("value") or "").strip()
+            token_display = "token-{}".format(str(info.get("id") or "")[:8])
+        else:
+            token = token_manager.get_available(strategy=client.token_rotation_strategy)
+
+        if not token:
+            return {
+                "ok": False,
+                "error": "No active tokens available in the pool",
+                "token": token_display,
+            }
+
+        timeout = max(10, min(int(req.timeout or 180), 600))
+        protocol = str(req.protocol or "service").strip().lower()
+        try:
+            if protocol == "firefly":
+                image_bytes, meta = _firefly_generate(
+                    client,
+                    token=token,
+                    prompt=prompt,
+                    aspect_ratio=ratio,
+                    output_resolution=resolution,
+                    timeout=timeout,
+                )
+            else:
+                image_bytes, meta = client.generate(
+                    token=token,
+                    prompt=prompt,
+                    aspect_ratio=ratio,
+                    output_resolution=resolution,
+                    upstream_model_id="gemini-flash",
+                    upstream_model_version="nano-banana-2",
+                    quality_level=None,
+                    detail_level=None,
+                    timeout=timeout,
+                )
+        except QuotaExhaustedError:
+            token_manager.report_exhausted(token)
+            return {
+                "ok": False,
+                "error": "Token quota exhausted.",
+                "error_type": "QuotaExhaustedError",
+                "token": token_display,
+            }
+        except AuthError:
+            token_manager.report_invalid(token)
+            return {
+                "ok": False,
+                "error": "Token invalid or expired.",
+                "error_type": "AuthError",
+                "token": token_display,
+            }
+        except UpstreamTemporaryError as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "error_type": "UpstreamTemporaryError",
+                "token": token_display,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "token": token_display,
+            }
+
+        if not image_bytes:
+            return {
+                "ok": False,
+                "error": "No image bytes returned",
+                "token": token_display,
+                "meta": _json_safe_meta(meta),
+            }
+
+        try:
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+        except Exception:
+            encoded = ""
+        return {
+            "ok": True,
+            "image_base64": encoded,
+            "mime_type": "image/png",
+            "size_bytes": len(image_bytes),
+            "token": token_display,
+            "meta": _json_safe_meta(meta),
+        }
 
     @router.get("/login", include_in_schema=False)
     def page_login(request: Request):
